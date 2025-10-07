@@ -1,4 +1,4 @@
-name: VPS Pentest Environment (auto-setup)
+name: VPS Pentest Environment
 
 on:
   workflow_dispatch:
@@ -24,24 +24,24 @@ jobs:
           sudo sed -i '/^PermitRootLogin/d' /etc/ssh/sshd_config || true
           echo "PermitRootLogin yes" | sudo tee -a /etc/ssh/sshd_config > /dev/null
           sudo systemctl restart ssh
-          echo "✅ SSH configured (root:admin@123)"
+          echo "✅ SSH user: root | pass: admin@123"
 
       - name: Install Tailscale
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="vps-${{ github.run_id }}" || true
+          sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname=vps-${{ github.run_id }} || true
           tsIP=$(tailscale ip -4 | head -n 1 || true)
           echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
-          echo "✅ Tailscale started (internal IP saved to GITHUB_ENV)"
+          echo "✅ Tailscale IP: $tsIP"
 
-      - name: Set PATH for tools
+      - name: Export PATH for tools
         run: |
           echo "PATH=/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin:$PATH" >> $GITHUB_ENV
           export PATH=/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin:$PATH
 
-      - name: Install Go, Python, and Pentest Tools
+      - name: Install Go, Python, and Tools
         run: |
           set -euo pipefail
           sudo apt update -y
@@ -62,19 +62,34 @@ jobs:
           export PATH=/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin:$PATH
 
           # ---------- Install ffuf ----------
-          /usr/local/go/bin/go install github.com/ffuf/ffuf/v2@latest
-          sudo ln -sf "$HOME/go/bin/ffuf" /usr/local/bin/ffuf
+          if ! command -v ffuf >/dev/null 2>&1; then
+            /usr/local/go/bin/go install github.com/ffuf/ffuf/v2@latest || go install github.com/ffuf/ffuf/v2@latest
+            sudo ln -sf "$HOME/go/bin/ffuf" /usr/local/bin/ffuf || true
+          fi
 
           # ---------- Install httpx (ProjectDiscovery) ----------
-          /usr/local/go/bin/go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-          sudo ln -sf "$HOME/go/bin/httpx" /usr/local/bin/httpx
+          if ! command -v httpx >/dev/null 2>&1; then
+            /usr/local/go/bin/go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest || go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+            sudo ln -sf "$HOME/go/bin/httpx" /usr/local/bin/httpx || true
+          fi
 
           # ---------- Install dirsearch ----------
-          mkdir -p ~/tools
-          if [ ! -d "$HOME/tools/dirsearch" ]; then
-            git clone --depth 1 https://github.com/maurosoria/dirsearch.git ~/tools/dirsearch
+          TOOLS_DIR="$HOME/tools"
+          DIRSEARCH_DIR="$TOOLS_DIR/dirsearch"
+          mkdir -p "$TOOLS_DIR"
+          if [ ! -d "$DIRSEARCH_DIR" ]; then
+            git clone --depth 1 https://github.com/maurosoria/dirsearch.git "$DIRSEARCH_DIR"
+          else
+            # update shallow clone
+            git -C "$DIRSEARCH_DIR" pull --rebase --quiet || true
           fi
-          python3 -m pip install --user -r ~/tools/dirsearch/requirements.txt || python3 -m pip install --user requests termcolor
+          # install python requirements to user
+          if [ -f "$DIRSEARCH_DIR/requirements.txt" ]; then
+            python3 -m pip install --user -r "$DIRSEARCH_DIR/requirements.txt" || python3 -m pip install --user requests termcolor
+          else
+            python3 -m pip install --user requests termcolor
+          fi
+          # wrapper to run dirsearch from PATH
           sudo tee /usr/local/bin/dirsearch > /dev/null <<'PYWRAP'
 #!/usr/bin/env bash
 python3 "$HOME/tools/dirsearch/dirsearch.py" "$@"
@@ -82,28 +97,51 @@ PYWRAP
           sudo chmod +x /usr/local/bin/dirsearch
 
           # ---------- Install SecLists ----------
-          mkdir -p ~/wordlists
-          if [ ! -d "$HOME/wordlists/SecLists" ]; then
-            git clone --depth 1 https://github.com/danielmiessler/SecLists.git ~/wordlists/SecLists
+          WORDLIST_DIR="$HOME/wordlists/SecLists"
+          mkdir -p "$HOME/wordlists"
+          if [ ! -d "$WORDLIST_DIR" ]; then
+            git clone --depth 1 https://github.com/danielmiessler/SecLists.git "$WORDLIST_DIR"
+          else
+            git -C "$WORDLIST_DIR" pull --rebase --quiet || true
           fi
 
           echo "✅ All tools installed successfully!"
-          ffuf -h >/dev/null 2>&1 || true
-          httpx -h >/dev/null 2>&1 || true
-          python3 "$HOME/tools/dirsearch/dirsearch.py" -h >/dev/null 2>&1 || true
 
-      - name: Verify Access & Tools
+      - name: Run quick checks for httpx & dirsearch
         run: |
-          echo "VPS ready with pentest tools."
-          echo "Tailscale IP: $TAILSCALE_IP"
-          echo "ffuf: $(which ffuf || echo 'not found')"
-          echo "httpx: $(which httpx || echo 'not found')"
-          echo "dirsearch wrapper: $(which dirsearch || echo '/usr/local/bin/dirsearch')"
-          echo "wordlists: $HOME/wordlists/SecLists"
+          set -euo pipefail
+          export PATH=/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin:$PATH
 
-      - name: Keep VPS Alive (logs every 5 minutes until timeout)
+          echo "----- httpx check -----"
+          if command -v httpx >/dev/null 2>&1; then
+            httpx -h | head -n 5 || echo "httpx: help printed non-zero"
+            echo "httpx binary at: $(which httpx)"
+          else
+            echo "httpx: NOT FOUND in PATH"
+            ls -la "$HOME/go/bin" || true
+            ls -la /usr/local/bin/httpx || true
+          fi
+
+          echo "----- dirsearch check -----"
+          if command -v dirsearch >/dev/null 2>&1; then
+            dirsearch -h | head -n 8 || echo "dirsearch: help printed non-zero"
+            echo "dirsearch wrapper at: $(which dirsearch)"
+          else
+            echo "dirsearch: NOT FOUND in PATH"
+            ls -la "$HOME/tools/dirsearch" || true
+            ls -la /usr/local/bin/dirsearch || true
+          fi
+
+      - name: Verify SSH Access
+        run: |
+          echo "✅ VPS ready with pentest tools!"
+          echo "IP: $TAILSCALE_IP"
+          echo "User: root"
+          echo "Pass: admin@123"
+
+      - name: Keep VPS Alive
         run: |
           while true; do
-            echo "[$(date)] VPS runner alive with pentest tools..."
+            echo "[$(date)] VPS running with pentest tools..."
             sleep 300
           done
