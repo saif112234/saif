@@ -27,7 +27,7 @@ jobs:
           path: |
             ~/.cache/pip
             ~/.cache/pip/http
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-${{ matrix.python-version || 'py' }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-v1
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -47,6 +47,7 @@ jobs:
           sudo apt install -y openssh-server
           sudo systemctl enable ssh
           sudo systemctl start ssh
+          # NOTE: enabling root login with password is insecure; kept as requested
           echo "root:admin@123" | sudo chpasswd
           sudo sed -i '/^PermitRootLogin/d' /etc/ssh/sshd_config || true
           echo "PermitRootLogin yes" | sudo tee -a /etc/ssh/sshd_config > /dev/null
@@ -80,7 +81,7 @@ jobs:
       - name: Install latest Go
         run: |
           set -euo pipefail
-          LATEST_GO=$(curl -fsS https://go.dev/VERSION?m=text | head -n 1)
+          LATEST_GO=$(curl -fsS https://go.dev/VERSION?m=text | head -n 1 || echo "go1.20.7")
           echo "Detected Go: ${LATEST_GO}"
           TGZ="/tmp/${LATEST_GO}.linux-amd64.tar.gz"
           wget -q -O "${TGZ}" "https://go.dev/dl/${LATEST_GO}.linux-amd64.tar.gz"
@@ -120,9 +121,8 @@ jobs:
             sudo ln -sf "$HOME/go/bin/subfinder" /usr/local/bin/subfinder || true
           fi
 
-          # amass (install via apt if available else go)
+          # amass (apt if available else go)
           if ! command -v amass >/dev/null 2>&1; then
-            # try apt first
             if apt-cache show amass >/dev/null 2>&1; then
               sudo apt install -y amass || true
             else
@@ -146,10 +146,10 @@ jobs:
           else
             python3 -m pip install --user requests termcolor
           fi
-          sudo tee /usr/local/bin/dirsearch > /dev/null << 'EOF'
+          sudo bash -c 'cat > /usr/local/bin/dirsearch << "EOF"
 #!/usr/bin/env bash
 python3 "$HOME/tools/dirsearch/dirsearch.py" "$@"
-EOF
+EOF'
           sudo chmod +x /usr/local/bin/dirsearch
 
       - name: Install SecLists (wordlists)
