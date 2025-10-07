@@ -1,4 +1,4 @@
-name: VPS Pentest Environment2
+name: VPS Full Pentest Environment (auto-setup + cache)
 
 on:
   workflow_dispatch:
@@ -13,6 +13,33 @@ jobs:
     steps:
       - name: Checkout (optional)
         uses: actions/checkout@v4
+
+      - name: Set up cache directories
+        run: |
+          mkdir -p $HOME/.cache/pip
+          mkdir -p $HOME/.cache/go-build
+          mkdir -p $HOME/go/pkg/mod
+          mkdir -p $HOME/go/bin
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/pip/http
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}-${{ matrix.python-version || 'py' }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}-v1
+          restore-keys: |
+            ${{ runner.os }}-go-
 
       - name: Install & Configure SSH
         run: |
@@ -31,7 +58,7 @@ jobs:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname=vps-${{ github.run_id }} || true
+          sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="vps-${{ github.run_id }}" || true
           tsIP=$(tailscale ip -4 | head -n 1 || true)
           echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
           echo "✅ Tailscale IP: $tsIP"
@@ -41,16 +68,18 @@ jobs:
           echo "PATH=/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin:$PATH" >> $GITHUB_ENV
           export PATH=/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin:$PATH
 
-      - name: Install Go, Python, and Tools
+      - name: Install system packages
         run: |
-          set -euo pipefail
           sudo apt update -y
-          sudo apt install -y python3 python3-pip python3-venv git curl wget unzip build-essential ca-certificates jq net-tools
+          sudo apt install -y python3 python3-pip python3-venv git curl wget unzip build-essential ca-certificates jq net-tools nmap masscan sqlmap
 
-          # Upgrade pip for user
+      - name: Upgrade pip (user)
+        run: |
           python3 -m pip install --upgrade --user pip setuptools wheel
 
-          # ---------- Install latest Go ----------
+      - name: Install latest Go
+        run: |
+          set -euo pipefail
           LATEST_GO=$(curl -fsS https://go.dev/VERSION?m=text | head -n 1)
           echo "Detected Go: ${LATEST_GO}"
           TGZ="/tmp/${LATEST_GO}.linux-amd64.tar.gz"
@@ -60,84 +89,106 @@ jobs:
           rm -f "${TGZ}"
           mkdir -p "$HOME/go/bin"
           export PATH=/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin:$PATH
+          echo "Go: $(/usr/local/go/bin/go version || go version || echo 'go not found')"
 
-          # ---------- Install ffuf ----------
+      - name: Install Go-based tools (ffuf, httpx, gobuster, subfinder, amass)
+        run: |
+          set -euo pipefail
+          export PATH=/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin:$PATH
+
+          # ffuf
           if ! command -v ffuf >/dev/null 2>&1; then
             /usr/local/go/bin/go install github.com/ffuf/ffuf/v2@latest || go install github.com/ffuf/ffuf/v2@latest
             sudo ln -sf "$HOME/go/bin/ffuf" /usr/local/bin/ffuf || true
           fi
 
-          # ---------- Install httpx (ProjectDiscovery) ----------
+          # httpx (ProjectDiscovery)
           if ! command -v httpx >/dev/null 2>&1; then
             /usr/local/go/bin/go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest || go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
             sudo ln -sf "$HOME/go/bin/httpx" /usr/local/bin/httpx || true
           fi
 
-          # ---------- Install dirsearch ----------
-          TOOLS_DIR="$HOME/tools"
-          DIRSEARCH_DIR="$TOOLS_DIR/dirsearch"
-          mkdir -p "$TOOLS_DIR"
+          # gobuster
+          if ! command -v gobuster >/dev/null 2>&1; then
+            /usr/local/go/bin/go install github.com/OJ/gobuster/v3@latest || go install github.com/OJ/gobuster/v3@latest
+            sudo ln -sf "$HOME/go/bin/gobuster" /usr/local/bin/gobuster || true
+          fi
+
+          # subfinder
+          if ! command -v subfinder >/dev/null 2>&1; then
+            /usr/local/go/bin/go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest || go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+            sudo ln -sf "$HOME/go/bin/subfinder" /usr/local/bin/subfinder || true
+          fi
+
+          # amass (install via apt if available else go)
+          if ! command -v amass >/dev/null 2>&1; then
+            # try apt first
+            if apt-cache show amass >/dev/null 2>&1; then
+              sudo apt install -y amass || true
+            else
+              /usr/local/go/bin/go install github.com/OWASP/Amass/v3/...@latest || go install github.com/OWASP/Amass/v3/...@latest
+              sudo ln -sf "$HOME/go/bin/amass" /usr/local/bin/amass || true
+            fi
+          fi
+
+      - name: Install dirsearch (python) and wrapper
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/tools"
+          DIRSEARCH_DIR="$HOME/tools/dirsearch"
           if [ ! -d "$DIRSEARCH_DIR" ]; then
             git clone --depth 1 https://github.com/maurosoria/dirsearch.git "$DIRSEARCH_DIR"
           else
             git -C "$DIRSEARCH_DIR" pull --rebase --quiet || true
           fi
-          # install python requirements to user
           if [ -f "$DIRSEARCH_DIR/requirements.txt" ]; then
             python3 -m pip install --user -r "$DIRSEARCH_DIR/requirements.txt" || python3 -m pip install --user requests termcolor
           else
             python3 -m pip install --user requests termcolor
           fi
-
-      - name: Create dirsearch wrapper
-        run: |
           sudo tee /usr/local/bin/dirsearch > /dev/null << 'EOF'
 #!/usr/bin/env bash
 python3 "$HOME/tools/dirsearch/dirsearch.py" "$@"
 EOF
           sudo chmod +x /usr/local/bin/dirsearch
 
-      - name: Install SecLists
+      - name: Install SecLists (wordlists)
         run: |
-          WORDLIST_DIR="$HOME/wordlists/SecLists"
           mkdir -p "$HOME/wordlists"
-          if [ ! -d "$WORDLIST_DIR" ]; then
-            git clone --depth 1 https://github.com/danielmiessler/SecLists.git "$WORDLIST_DIR"
+          if [ ! -d "$HOME/wordlists/SecLists" ]; then
+            git clone --depth 1 https://github.com/danielmiessler/SecLists.git "$HOME/wordlists/SecLists"
           else
-            git -C "$WORDLIST_DIR" pull --rebase --quiet || true
+            git -C "$HOME/wordlists/SecLists" pull --rebase --quiet || true
           fi
 
-      - name: Run quick checks for httpx & dirsearch
+      - name: Final checks (show versions)
         run: |
-          set -euo pipefail
           export PATH=/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin:$PATH
+          echo "---- tools summary ----"
+          ffuf -version 2>/dev/null || echo "ffuf: not found"
+          httpx -version 2>/dev/null || echo "httpx: not found"
+          gobuster -h >/dev/null 2>&1 || echo "gobuster: not found"
+          subfinder -h >/dev/null 2>&1 || echo "subfinder: not found"
+          amass -h >/dev/null 2>&1 || echo "amass: not found (ok if not installed via apt)"
+          dirsearch -h >/dev/null 2>&1 || echo "dirsearch: not found"
+          nmap --version 2>/dev/null || echo "nmap: not found"
+          masscan --version 2>/dev/null || echo "masscan: not found"
+          sqlmap --version 2>/dev/null || echo "sqlmap: not found"
+          echo "SecLists: $HOME/wordlists/SecLists (files: $(ls -1 "$HOME/wordlists/SecLists" | head -n 5 || true))"
 
-          echo "----- httpx check -----"
-          if command -v httpx >/dev/null 2>&1; then
-            httpx -h | head -n 5 || echo "httpx: help printed non-zero"
-            echo "httpx binary at: $(which httpx)"
-          else
-            echo "httpx: NOT FOUND in PATH"
-          fi
-
-          echo "----- dirsearch check -----"
-          if command -v dirsearch >/dev/null 2>&1; then
-            dirsearch -h | head -n 8 || echo "dirsearch: help printed non-zero"
-            echo "dirsearch wrapper at: $(which dirsearch)"
-          else
-            echo "dirsearch: NOT FOUND in PATH"
-          fi
-
-      - name: Verify SSH Access
+      - name: Verify Access & Info
         run: |
-          echo "✅ VPS ready with pentest tools!"
-          echo "IP: $TAILSCALE_IP"
-          echo "User: root"
-          echo "Pass: admin@123"
+          echo "VPS runner ready with pentest tools."
+          echo "Tailscale IP: $TAILSCALE_IP"
+          echo "ffuf: $(which ffuf || echo 'not found')"
+          echo "httpx: $(which httpx || echo 'not found')"
+          echo "dirsearch wrapper: $(which dirsearch || echo '/usr/local/bin/dirsearch')"
+          echo "gobuster: $(which gobuster || echo 'not found')"
+          echo "subfinder: $(which subfinder || echo 'not found')"
 
-      - name: Keep VPS Alive
+      - name: Keep VPS Alive (logs every 5 minutes until timeout)
         run: |
           while true; do
-            echo "[$(date)] VPS running with pentest tools..."
+            echo "[$(date)] VPS runner alive with pentest tools..."
             sleep 300
           done
