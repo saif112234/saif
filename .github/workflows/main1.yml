@@ -1,4 +1,4 @@
-name: VPS Pentest Environment
+name: VPS Pentest Environment (auto-setup)
 
 on:
   workflow_dispatch:
@@ -11,55 +11,99 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Install Go, Python, and Pentest Tools
+      - name: Checkout (optional)
+        uses: actions/checkout@v4
+
+      - name: Install & Configure SSH
         run: |
           sudo apt update -y
-          sudo apt install -y python3 python3-pip python3-venv git curl wget unzip build-essential
+          sudo apt install -y openssh-server
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
+          echo "root:admin@123" | sudo chpasswd
+          sudo sed -i '/^PermitRootLogin/d' /etc/ssh/sshd_config || true
+          echo "PermitRootLogin yes" | sudo tee -a /etc/ssh/sshd_config > /dev/null
+          sudo systemctl restart ssh
+          echo "✅ SSH configured (root:admin@123)"
 
-          # Install Go
-          LATEST_GO=$(curl -s https://go.dev/VERSION?m=text | head -n 1)
-          wget "https://go.dev/dl/${LATEST_GO}.linux-amd64.tar.gz"
-          sudo tar -C /usr/local -xzf "${LATEST_GO}.linux-amd64.tar.gz"
-          export PATH=$PATH:/usr/local/go/bin:~/go/bin
-          echo 'export PATH=$PATH:/usr/local/go/bin:~/go/bin' >> ~/.bashrc
-          go version
+      - name: Install Tailscale
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="vps-${{ github.run_id }}" || true
+          tsIP=$(tailscale ip -4 | head -n 1 || true)
+          echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
+          echo "✅ Tailscale started (internal IP saved to GITHUB_ENV)"
 
-          # Install ffuf
+      - name: Set PATH for tools
+        run: |
+          echo "PATH=/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin:$PATH" >> $GITHUB_ENV
+          export PATH=/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin:$PATH
+
+      - name: Install Go, Python, and Pentest Tools
+        run: |
+          set -euo pipefail
+          sudo apt update -y
+          sudo apt install -y python3 python3-pip python3-venv git curl wget unzip build-essential ca-certificates jq net-tools
+
+          # Upgrade pip for user
+          python3 -m pip install --upgrade --user pip setuptools wheel
+
+          # ---------- Install latest Go ----------
+          LATEST_GO=$(curl -fsS https://go.dev/VERSION?m=text || echo "go1.20.7")
+          echo "Detected Go: ${LATEST_GO}"
+          TGZ="/tmp/${LATEST_GO}.linux-amd64.tar.gz"
+          wget -q -O "${TGZ}" "https://go.dev/dl/${LATEST_GO}.linux-amd64.tar.gz"
+          sudo rm -rf /usr/local/go
+          sudo tar -C /usr/local -xzf "${TGZ}"
+          rm -f "${TGZ}"
+          mkdir -p "$HOME/go/bin"
+          export PATH=/usr/local/go/bin:$HOME/go/bin:$HOME/.local/bin:$PATH
+
+          # ---------- Install ffuf ----------
           /usr/local/go/bin/go install github.com/ffuf/ffuf/v2@latest
-          sudo ln -sf ~/go/bin/ffuf /usr/local/bin/ffuf
+          sudo ln -sf "$HOME/go/bin/ffuf" /usr/local/bin/ffuf
 
-          # Install httpx (ProjectDiscovery)
+          # ---------- Install httpx (ProjectDiscovery) ----------
           /usr/local/go/bin/go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-          sudo ln -sf ~/go/bin/httpx /usr/local/bin/httpx
+          sudo ln -sf "$HOME/go/bin/httpx" /usr/local/bin/httpx
 
-          # Install dirsearch
+          # ---------- Install dirsearch ----------
           mkdir -p ~/tools
-          git clone https://github.com/maurosoria/dirsearch.git ~/tools/dirsearch
-          pip3 install -r ~/tools/dirsearch/requirements.txt
-          sudo ln -sf ~/tools/dirsearch/dirsearch.py /usr/local/bin/dirsearch
+          if [ ! -d "$HOME/tools/dirsearch" ]; then
+            git clone --depth 1 https://github.com/maurosoria/dirsearch.git ~/tools/dirsearch
+          fi
+          python3 -m pip install --user -r ~/tools/dirsearch/requirements.txt || python3 -m pip install --user requests termcolor
+          sudo tee /usr/local/bin/dirsearch > /dev/null <<'PYWRAP'
+#!/usr/bin/env bash
+python3 "$HOME/tools/dirsearch/dirsearch.py" "$@"
+PYWRAP
           sudo chmod +x /usr/local/bin/dirsearch
 
-          # Install SecLists
+          # ---------- Install SecLists ----------
           mkdir -p ~/wordlists
-          git clone https://github.com/danielmiessler/SecLists.git ~/wordlists/SecLists
+          if [ ! -d "$HOME/wordlists/SecLists" ]; then
+            git clone --depth 1 https://github.com/danielmiessler/SecLists.git ~/wordlists/SecLists
+          fi
 
           echo "✅ All tools installed successfully!"
-          echo "-------------------------"
-          ffuf -version
-          httpx -version
-          python3 /usr/local/bin/dirsearch -h | head -n 5
+          ffuf -h >/dev/null 2>&1 || true
+          httpx -h >/dev/null 2>&1 || true
+          python3 "$HOME/tools/dirsearch/dirsearch.py" -h >/dev/null 2>&1 || true
 
-
-      - name: Verify SSH Access
+      - name: Verify Access & Tools
         run: |
-          echo "✅ VPS ready with pentest tools!"
-          echo "IP: $TAILSCALE_IP"
-          echo "User: root"
-          echo "Pass: admin@123"
+          echo "VPS ready with pentest tools."
+          echo "Tailscale IP: $TAILSCALE_IP"
+          echo "ffuf: $(which ffuf || echo 'not found')"
+          echo "httpx: $(which httpx || echo 'not found')"
+          echo "dirsearch wrapper: $(which dirsearch || echo '/usr/local/bin/dirsearch')"
+          echo "wordlists: $HOME/wordlists/SecLists"
 
-      - name: Keep VPS Alive
+      - name: Keep VPS Alive (logs every 5 minutes until timeout)
         run: |
           while true; do
-            echo "[$(date)] VPS running with pentest tools..."
+            echo "[$(date)] VPS runner alive with pentest tools..."
             sleep 300
           done
