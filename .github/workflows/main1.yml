@@ -1,0 +1,77 @@
+name: VPS Pentest Environment
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # كل 6 ساعات
+
+jobs:
+  setup-vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Install & Configure SSH
+        run: |
+          sudo apt update -y
+          sudo apt install -y openssh-server
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
+          echo "root:admin@123" | sudo chpasswd
+          echo "PermitRootLogin yes" | sudo tee -a /etc/ssh/sshd_config
+          sudo service ssh restart
+          echo "✅ SSH user: root | pass: admin@123"
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=vps-${{ github.run_id }}
+          tsIP=$(tailscale ip -4 | head -n 1)
+          echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
+          echo "✅ Tailscale IP: $tsIP"
+
+      - name: Install Go, Python, and Tools
+        run: |
+          sudo apt update -y
+          sudo apt install -y python3 python3-pip python3-venv git curl wget unzip build-essential
+
+          # Install Go
+          LATEST_GO=$(curl -s https://go.dev/VERSION?m=text | head -n 1)
+          wget "https://go.dev/dl/${LATEST_GO}.linux-amd64.tar.gz"
+          sudo tar -C /usr/local -xzf "${LATEST_GO}.linux-amd64.tar.gz"
+          export PATH=$PATH:/usr/local/go/bin:~/go/bin
+          echo 'export PATH=$PATH:/usr/local/go/bin:~/go/bin' >> ~/.bashrc
+          go version
+
+          # Install ffuf
+          /usr/local/go/bin/go install github.com/ffuf/ffuf/v2@latest
+          sudo ln -sf ~/go/bin/ffuf /usr/local/bin/ffuf
+
+          # Install httpx
+          /usr/local/go/bin/go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+          sudo ln -sf ~/go/bin/httpx /usr/local/bin/httpx
+
+          # Install dirsearch
+          git clone https://github.com/maurosoria/dirsearch.git ~/tools/dirsearch
+          pip3 install -r ~/tools/dirsearch/requirements.txt
+
+          # Install SecLists
+          git clone https://github.com/danielmiessler/SecLists.git ~/wordlists/SecLists
+
+          echo "✅ All tools installed successfully!"
+          ffuf -h | head -n 2
+          httpx -h | head -n 2
+
+      - name: Verify SSH Access
+        run: |
+          echo "✅ VPS ready with pentest tools!"
+          echo "IP: $TAILSCALE_IP"
+          echo "User: root"
+          echo "Pass: admin@123"
+
+      - name: Keep VPS Alive
+        run: |
+          while true; do
+            echo "[$(date)] VPS running with pentest tools..."
+            sleep 300
+          done
